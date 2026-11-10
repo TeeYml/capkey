@@ -1,0 +1,9 @@
+[package]
+name = "capkey-lock"
+version = "0.2.0"
+edition = "2021"
+license = "MIT"
+description = "CKB lock script that caps what a delegate key can spend from a vault Cell."
+
+[dependencies]
+ckb-std = { version = "1.1.0", default-features = false, features = ["allocator", "calc-hash", "ckb-types", "dummy-atomic"] }
