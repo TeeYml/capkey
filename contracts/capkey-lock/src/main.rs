@@ -18,10 +18,15 @@ use ckb_std::{
     ckb_constants::Source,
     ckb_types::{bytes::Bytes, prelude::*},
     error::SysError,
-    high_level::{load_cell_lock_hash, load_script, QueryIter},
+    high_level::{
+        load_cell_capacity, load_cell_data, load_cell_lock_hash, load_cell_type_hash, load_script,
+        load_script_hash, QueryIter,
+    },
 };
 
 const ARGS_LEN: usize = 64;
+const DATA_LEN: usize = 28;
+const MAGIC: [u8; 4] = *b"CK01";
 
 #[repr(i8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -56,10 +61,15 @@ impl From<SysError> for Error {
     }
 }
 
-#[allow(dead_code)] // delegate_lock_hash is used once the delegate path lands
 struct VaultArgs {
     owner_lock_hash: [u8; 32],
     delegate_lock_hash: [u8; 32],
+}
+
+struct VaultData {
+    max_per_tx: u64,
+    remaining_allowance: u64,
+    last_sequence: u64,
 }
 
 fn parse_args(args: &[u8]) -> Result<VaultArgs, Error> {
@@ -73,6 +83,23 @@ fn parse_args(args: &[u8]) -> Result<VaultArgs, Error> {
     Ok(VaultArgs {
         owner_lock_hash,
         delegate_lock_hash,
+    })
+}
+
+fn read_u64(bytes: &[u8], offset: usize) -> u64 {
+    let mut buf = [0u8; 8];
+    buf.copy_from_slice(&bytes[offset..offset + 8]);
+    u64::from_le_bytes(buf)
+}
+
+fn parse_data(data: &[u8]) -> Result<VaultData, Error> {
+    if data.len() != DATA_LEN || data[..4] != MAGIC {
+        return Err(Error::InvalidData);
+    }
+    Ok(VaultData {
+        max_per_tx: read_u64(data, 4),
+        remaining_allowance: read_u64(data, 12),
+        last_sequence: read_u64(data, 20),
     })
 }
 
@@ -90,6 +117,56 @@ fn run() -> Result<(), Error> {
     }
     if !input_with_lock_exists(&args.delegate_lock_hash) {
         return Err(Error::NotAuthorized);
+    }
+    check_delegate_spend()
+}
+
+fn check_delegate_spend() -> Result<(), Error> {
+    let own_hash = load_script_hash()?;
+
+    // Exactly one vault Cell is consumed and exactly one is created, so a
+    // single transaction cannot split or merge vaults to dodge the caps.
+    if QueryIter::new(load_cell_capacity, Source::GroupInput).count() != 1
+        || QueryIter::new(load_cell_lock_hash, Source::Output)
+            .filter(|hash| hash == &own_hash)
+            .count()
+            != 1
+    {
+        return Err(Error::InvalidGroupShape);
+    }
+
+    // The successor must sit at output 0 with the same script.
+    if load_cell_lock_hash(0, Source::Output)? != own_hash {
+        return Err(Error::OutputLockChanged);
+    }
+    if load_cell_type_hash(0, Source::Output)?.is_some() {
+        return Err(Error::OutputHasTypeScript);
+    }
+
+    let input = parse_data(&load_cell_data(0, Source::GroupInput)?)?;
+    let output = parse_data(&load_cell_data(0, Source::Output)?)?;
+
+    let in_capacity = load_cell_capacity(0, Source::GroupInput)?;
+    let out_capacity = load_cell_capacity(0, Source::Output)?;
+    let spent = match in_capacity.checked_sub(out_capacity) {
+        Some(spent) if spent > 0 => spent,
+        _ => return Err(Error::CapacityNotReduced),
+    };
+
+    if spent > input.max_per_tx {
+        return Err(Error::ExceedsPerTxCap);
+    }
+    if spent > input.remaining_allowance {
+        return Err(Error::ExceedsAllowance);
+    }
+    if output.max_per_tx != input.max_per_tx {
+        return Err(Error::BadCapUpdate);
+    }
+    if output.remaining_allowance != input.remaining_allowance - spent {
+        return Err(Error::BadAllowanceUpdate);
+    }
+    if input.last_sequence.checked_add(1) != Some(output.last_sequence) {
+        return Err(Error::BadSequence);
     }
     Ok(())
 }
