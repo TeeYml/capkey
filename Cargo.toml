@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
-members = ["contracts/*"]
+members = ["contracts/capkey-lock", "tests"]
+default-members = ["tests"]
 
 [profile.release]
 overflow-checks = true
